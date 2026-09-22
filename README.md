@@ -1,37 +1,43 @@
-If you like this extension, please star the repository. It helps the extension's visibility in the marketplace and helps me measure how many people are using it.
+> **This is a fork of [Maskowh/spicetify-old-like-button-extension](https://github.com/Maskowh/spicetify-old-like-button-extension)**, substantially reworked after the original stopped working following Spotify client updates. The original repository appears inactive — see [Credits](#credits).
 
 # Old Like Button Extension
 
 ![Example](example.png)
-_This script adds the old like button next to the new "Add to Playlist" on tracklist rows. It also shows with a half-heart if you like another version of the same track_
+_Adds the old "like" button back next to the new "Add to Playlist" button on tracklist rows, including a half-heart indicator when you like a different version (remaster, live version, etc.) of the same recording._
 
-I know that you can natively bring back the old like button by disabling the Experimental Feature "Enable Aligned Curation", but I made this extension to have both buttons: the "Add to Liked Songs" one and the "Add to Playlist" one.
+## What changed in this fork
 
-## Disclaimer
-I'm pretty new to Spicetify but also to JS, so there might be some bugs / optimisable code. Please let me know!
-I made this extension basing myself on [Quick Queue Extension](https://github.com/ohitstom/spicetify-extensions/blob/main/quickQueue/README.md), espicially for the rendering. Thanks to [ohitstom](https://github.com/ohitstom) for making those two extensions compatible.
+The original extension broke because Spotify changed several things it depended on:
+
+- **Liked-status and add/remove had stopped working.** The extension used an internal Cosmos endpoint and the public Spotify Web API (`api.spotify.com`) to read/write Liked Songs. Spotify has since removed that internal endpoint and started rate-limiting `api.spotify.com` heavily, even for authenticated requests from the client itself. This now goes through `Spicetify.Platform.LibraryAPI`, the same API the client uses internally.
+- **The half-liked (ISRC) feature was completely broken**, for the same reason — ISRC lookups also went through the now-dead `api.spotify.com`, with no documented replacement. This fork instead calls the same internal metadata service Spotify's own client uses, found via reflection over its webpack module registry, and decodes the response with a small hand-written protobuf parser.
+- **The tooltip had no visible styling.** It used `Spicetify.Tippy`, an API that no longer matches how Spotify actually renders tooltips. Replaced with a small tooltip matching the real one's measured appearance.
+- **The button was 6px taller than its neighbors**, from a hardcoded CSS class name left over from an older Spotify version.
+- **A row could show the wrong track's liked status** after Spotify's virtualized list recycled it for a different song, because the row-identification logic searched in the wrong direction through React's internals. Fixed to walk up the fiber tree from the row instead of down into its children.
+- A handful of correctness fixes found through review: a response-handling bug that could permanently hang the refresh loop from a single malformed reply, a missing re-entrancy guard that let rapid double-clicks double-fire, two React root leaks, and a race where a slow periodic refresh could revert a click that had already succeeded.
+
+This is close to a full rewrite of the extension's core logic (see git history for the diff). The visual design and overall approach (playbar + tracklist row insertion) are still the original's.
 
 ## Installation
 
-### Manual Installation
+### Manual
 
-1. Install [Spicetify](https://spicetify.app) and set it up according to the instructions.
-2. Navigate to your Spicetify config directory via the command `spicetify config-dir`.
-3. Download oldLikeButton.js and place it in `/extensions`.
-4. Run `spicetify config extensions oldLikeButton.js` and `spicetify apply` in terminal.
+1. Install [Spicetify](https://spicetify.app).
+2. Run `spicetify config-dir` to find your config folder, then place `oldLikeButton.js` in its `Extensions` subfolder.
+3. Run `spicetify config extensions oldLikeButton.js` then `spicetify apply`.
 
-### Marketplace Installation
+### Marketplace
 
-1. Install [Spicetify](https://spicetify.app) and set it up according to the instructions, including the marketplace installation
-2. In the Extensions tab of the Marketplace page of your Spotify client, search `Old Like Button` and install it.
-3. Restart your client if needed.
+Search "Old Like Button" in the Extensions tab of Marketplace and install it. Marketplace discovers extensions automatically from public repos tagged `spicetify-extensions` on GitHub, so this fork is picked up the same way the original was.
 
 ## Usage
-Full heart means that you already like this track.
-Half-heart means that you like another version of the same track (same ISRC).
-No heart means that you don't like any song that has the same ISRC.
 
-Hover over tracklist row and click add/remove from Liked Songs.
+- **Full heart** — this track is in your Liked Songs.
+- **Half heart** — you don't have this exact track liked, but you do have a different version of the same recording (same ISRC — e.g. a remaster) liked.
+- **No heart** — neither.
 
-## Improvement planned
-- Handle local tracks (currently the button is disabled for local tracks)
+Hover a tracklist row to see the button; click to add or remove from Liked Songs.
+
+## Credits
+
+Original extension by [Maskowh](https://github.com/Maskowh), with the rendering approach based on [ohitstom](https://github.com/ohitstom)'s [Quick Queue extension](https://github.com/ohitstom/spicetify-extensions/blob/main/quickQueue/README.md). The original repository appears inactive, which is why this exists as an independent fork rather than a set of pull requests.

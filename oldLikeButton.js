@@ -3,94 +3,286 @@
 // DESCRIPTION: Adds a button to the tracklist to add/remove a song from Liked Songs.
 // Heavily inspired of https://github.com/ohitstom/spicetify-extensions/tree/main/quickQueue, especially for rendering
 
+let likedTrackUris = new Set();
+let likedIsrcByUri = new Map();
+let likedIsrcs = new Set();
+const likedTracksChangeEvent = new CustomEvent('likedTracksChange');
 
-let likedTracksIdsISRCs = new Map(); // ids/isrcs of all liked tracks, to check if we should display the heart icon or not. 
-let likedTracksISRCs = new Set(likedTracksIdsISRCs.values()); // isrcs of all liked tracks, to check if we should display the half-heart icon or not
+// Overlays a click's own result on the next periodic refresh so a stale
+// snapshot can't revert it; entries drop once the snapshot itself confirms them.
+let pendingLikeAdds = new Map();
+let pendingLikeRemoves = new Set();
 
-var proxyLikedTracksIdsISRCs; // proxy for likedTracksIds, to trigger an event on add/delete
+// v2: the v1 decoder had an offset-tracking bug that could cache wrong ISRCs.
+const ISRC_STORAGE_PREFIX = "oldlike-isrc-v2-";
 
-var likedTracksChangeEvent = new CustomEvent('likedTracksChange');
-
-async function initiateLikedSongs() {
-    if (
-        !(
-            Spicetify.CosmosAsync
-        )
-    ) {
-        setTimeout(initiateLikedSongs, 10);
-        return;
+function readIsrcCache(uri) {
+    try {
+        return localStorage.getItem(ISRC_STORAGE_PREFIX + uri.replace("spotify:track:", ""));
+    } catch (error) {
+        console.error("[Old Like Button] localStorage read failed", error);
+        return null;
     }
-    let likedTracksItems = await Spicetify.CosmosAsync.get("sp://core-collection/unstable/@/list/tracks/all?responseFormat=protobufJson");
-    let likedTracksIds = likedTracksItems.item.map(item => item.trackMetadata.link.replace("spotify:track:", ""));
-
-    let newLikedTracksIdsISRCs = new Map();
-    let likedTracksIdsWithUnknownISRCs = [];
-
-    likedTracksIds.forEach(trackId => {
-        const trackIsrc = localStorage.getItem("maskowh-oldlike-" + trackId)
-        if (trackIsrc != null) {
-            newLikedTracksIdsISRCs.set(trackId, trackIsrc)
-        } else if (!trackId.startsWith("spotify:local:")) {
-            likedTracksIdsWithUnknownISRCs.push(trackId);
-        }
-    });
-
-    let promises = [];
-
-    for (let i = 0; i < likedTracksIdsWithUnknownISRCs.length; i += 50) {
-        let batch = likedTracksIdsWithUnknownISRCs.slice(i, i + 50);
-        console.info("Requesting ISRCs for the following liked tracks: " + batch);
-        promises.push(
-            Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/tracks?ids=${batch.join(",")}`).then(response => {
-                response.tracks.forEach(track => {
-                    newLikedTracksIdsISRCs.set(track.id, track.external_ids.isrc);
-                    localStorage.setItem("maskowh-oldlike-" + track.id, track.external_ids.isrc);
-                });
-            })
-        );
-    }
-
-    await Promise.all(promises);
-
-    likedTracksIdsISRCs = newLikedTracksIdsISRCs;
-    likedTracksISRCs = new Set(likedTracksIdsISRCs.values());
-
-    proxyLikedTracksIdsISRCs = new Proxy(likedTracksIdsISRCs, {
-        get: function (target, property, receiver) {
-            // If the accessed property is a function and it's one of the methods I want to trigger an event for
-            if (['set', 'delete'].includes(property) && typeof target[property] === 'function') {
-                return function (...args) {
-                    // Original method call
-                    const result = target[property].apply(target, args);
-                    // Trigger the event to notify the buttons
-                    likedTracksISRCs = new Set(likedTracksIdsISRCs.values());
-                    document.dispatchEvent(likedTracksChangeEvent);
-                    return result;
-                };
-            }
-            // If the accessed property is not one of the intercepted methods, return the property as usual
-            return Reflect.get(target, property, receiver);
-        }
-    });
-
-    // This is to initiate the buttons, then to refresh it every 30 seconds to handle new/removed likes from other sources (mobile, web browser)
-    document.dispatchEvent(likedTracksChangeEvent);
-    setTimeout(initiateLikedSongs, 30000);
 }
 
-initiateLikedSongs();
+function writeIsrcCache(uri, isrc) {
+    try {
+        localStorage.setItem(ISRC_STORAGE_PREFIX + uri.replace("spotify:track:", ""), isrc);
+    } catch (error) {
+        console.error("[Old Like Button] localStorage write failed", error);
+    }
+}
+
+// api.spotify.com is dead in CosmosAsync and rate-limited even via direct fetch;
+// this instead calls the same internal metadata service the client itself uses.
+let cachedWebpackRequire;
+function getWebpackRequire() {
+    // Memoized so a metadata-service lookup that fails and retries later doesn't
+    // push a fresh chunk entry into webpack's own registry every single time.
+    if (cachedWebpackRequire) return cachedWebpackRequire;
+    const webpack = window.rspackChunkclient_web ?? window.webpackChunkclient_web ?? window.webpackChunkopen ?? window.rspackChunk;
+    if (!webpack) return null;
+    cachedWebpackRequire = webpack.push([[Symbol()], {}, re => re]);
+    return cachedWebpackRequire;
+}
+
+function findWebpackModules() {
+    const req = getWebpackRequire();
+    if (!req) return [];
+    return Object.keys(req.m)
+        .map(id => { try { return req(id); } catch { return undefined; } })
+        // A module exporting `window` itself would otherwise flatten every
+        // page global in here, including this script's own top-level functions.
+        .filter(m => m && typeof m === "object" && m !== window)
+        .flatMap(m => { try { return Object.values(m); } catch { return []; } });
+}
+
+function functionSource(fn) {
+    // Some webpack modules override toString with a non-function; go through
+    // Function.prototype directly instead of fn.toString().
+    try {
+        return Function.prototype.toString.call(fn);
+    } catch {
+        return "";
+    }
+}
+
+let cachedMetadataService;
+function getMetadataService() {
+    // Only a success is cached: on init not every lazy chunk is loaded yet, so a
+    // failed lookup here should retry later rather than being stuck forever.
+    if (cachedMetadataService) return cachedMetadataService;
+    const modules = findWebpackModules();
+    const unique = predicate => {
+        const matches = [...new Set(modules.filter(predicate))];
+        return matches.length === 1 ? matches[0] : null;
+    };
+    const descriptor = unique(m => typeof m === "function" && m.SERVICE_ID === "spotify.mdata_esperanto.proto.MetadataService");
+    const createTransport = unique(m => typeof m === "function" && /executeEsperantoCall/.test(functionSource(m)) && /cancelEsperantoCall/.test(functionSource(m)));
+    if (descriptor && createTransport) cachedMetadataService = { descriptor, instance: new descriptor(createTransport()) };
+    return cachedMetadataService ?? null;
+}
+
+function fetchTrackMetadataBytes(uris) {
+    return new Promise((resolve, reject) => {
+        const service = getMetadataService();
+        if (!service) {
+            reject(new Error("metadata service unavailable"));
+            return;
+        }
+        let settled = false;
+        // A track the service never fully resolves (removed, local file, ...)
+        // can leave this observation "pending" forever; don't block on that.
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(new Error("metadata service request timed out"));
+            try { cancel.cancel(); } catch (e) { console.error("[Old Like Button] cancel() after timeout failed", e); }
+        }, 8000);
+        const cancel = service.instance.observe(
+            service.descriptor.METHODS.observe.requestType.fromPartial({
+                extensionQuery: uris.map(uri => ({ entityUri: uri, extensionKind: 10 }))
+            }),
+            response => {
+                if (response.pendingResponse || settled) return;
+                settled = true;
+                clearTimeout(timer);
+                try { cancel.cancel(); } catch (e) { console.error("[Old Like Button] cancel() after response failed", e); }
+                // An uncaught throw here would leave this promise settled=true
+                // but never resolved/rejected, hanging every batch behind it.
+                try {
+                    resolve(response.extensionResult.map(r => ({
+                        uri: r.entityUri,
+                        ok: r.status === 1,
+                        bytes: r.status === 1 ? r.extensionData.value : null
+                    })));
+                } catch (error) {
+                    reject(error);
+                }
+            }
+        );
+    });
+}
+
+// Track protobuf: repeated ExternalId{type: string, id: string} at field 10.
+function decodeTrackIsrc(bytes) {
+    let offset = 0;
+    function readVarInt() {
+        let value = 0n, shift = 0n, b;
+        do { b = BigInt(bytes[offset++]); value |= (b & 0x7fn) << shift; shift += 7n; } while (b & 0x80n);
+        return value;
+    }
+    // subarray() silently clamps an out-of-range end instead of throwing, so a
+    // truncated buffer would otherwise decode a wrong-but-plausible string.
+    function takeBytes(len) {
+        if (offset + len > bytes.length) {
+            throw new Error("Truncated protobuf buffer");
+        }
+        const slice = bytes.subarray(offset, offset + len);
+        offset += len;
+        return slice;
+    }
+    function skip(wireType) {
+        // `offset += Number(readVarInt())` reads the pre-call offset before
+        // readVarInt's own side effect runs, undercounting by its byte length.
+        if (wireType === 0) {
+            readVarInt();
+        } else if (wireType === 1) {
+            offset += 8;
+        } else if (wireType === 2) {
+            takeBytes(Number(readVarInt()));
+        } else if (wireType === 5) {
+            offset += 4;
+        } else {
+            // Deprecated group encoding (3/4) or reserved (6/7); throw instead of
+            // leaving offset stuck, which would spin the loop below forever.
+            throw new Error("Unsupported protobuf wire type: " + wireType);
+        }
+    }
+    while (offset < bytes.length) {
+        const tag = Number(readVarInt());
+        const fieldNum = tag >> 3, wireType = tag & 7;
+        if (fieldNum === 10 && wireType === 2) {
+            const fieldLen = Number(readVarInt());
+            if (offset + fieldLen > bytes.length) {
+                throw new Error("Truncated protobuf buffer");
+            }
+            const end = offset + fieldLen;
+            let type, id;
+            while (offset < end) {
+                const innerTag = Number(readVarInt());
+                const innerField = innerTag >> 3, innerWireType = innerTag & 7;
+                if (innerWireType === 2 && (innerField === 1 || innerField === 2)) {
+                    const text = new TextDecoder().decode(takeBytes(Number(readVarInt())));
+                    if (innerField === 1) type = text;
+                    else id = text;
+                } else {
+                    skip(innerWireType);
+                }
+            }
+            if (type === "isrc" && id) return id;
+        } else {
+            skip(wireType);
+        }
+    }
+    return undefined;
+}
+
+async function resolveIsrcs(uris, concurrency = 8) {
+    const result = new Map();
+    const unknown = [];
+    for (const uri of uris) {
+        const cached = readIsrcCache(uri);
+        if (cached) result.set(uri, cached);
+        else unknown.push(uri);
+    }
+
+    const batches = [];
+    for (let i = 0; i < unknown.length; i += 50) {
+        batches.push(unknown.slice(i, i + 50));
+    }
+
+    // A shared queue drained by a small pool of concurrent workers: batches are
+    // independent RPCs, so awaiting them one at a time serializes for no reason.
+    let nextBatchIndex = 0;
+    async function worker() {
+        while (nextBatchIndex < batches.length) {
+            const batch = batches[nextBatchIndex++];
+            let entries;
+            try {
+                entries = await fetchTrackMetadataBytes(batch);
+            } catch (error) {
+                console.error("[Old Like Button] Failed to fetch ISRC batch", error);
+                continue;
+            }
+            for (const entry of entries) {
+                if (!entry.ok || !entry.bytes) continue;
+                let isrc;
+                try {
+                    isrc = decodeTrackIsrc(entry.bytes);
+                } catch {
+                    // Malformed/unrecognized shape for this one track; the rest of
+                    // the batch and the overall resolution still succeed.
+                    continue;
+                }
+                if (!isrc) continue;
+                result.set(entry.uri, isrc);
+                writeIsrcCache(entry.uri, isrc);
+            }
+        }
+    }
+
+    await Promise.all(Array.from({ length: Math.min(concurrency, batches.length) }, worker));
+    return result;
+}
+
+async function refreshLikedTracks() {
+    if (!(Spicetify.Platform && Spicetify.Platform.LibraryAPI)) {
+        setTimeout(refreshLikedTracks, 10);
+        return;
+    }
+    try {
+        const library = await Spicetify.Platform.LibraryAPI.getTracks({ limit: 9999999 });
+        const items = library?.items || [];
+        const snapshot = new Set(items.map(item => item.uri));
+
+        // A pending click can be older than this snapshot's own read (started
+        // before the click, finished after) and get reverted by it otherwise.
+        for (const uri of pendingLikeAdds.keys()) {
+            if (snapshot.has(uri)) pendingLikeAdds.delete(uri);
+        }
+        for (const uri of pendingLikeRemoves) {
+            if (!snapshot.has(uri)) pendingLikeRemoves.delete(uri);
+        }
+        for (const uri of pendingLikeAdds.keys()) snapshot.add(uri);
+        for (const uri of pendingLikeRemoves) snapshot.delete(uri);
+        likedTrackUris = snapshot;
+
+        const trackUris = [...likedTrackUris].filter(uri => uri.startsWith("spotify:track:"));
+        const isrcByUri = await resolveIsrcs(trackUris);
+        for (const [uri, isrc] of pendingLikeAdds) {
+            if (isrc && !isrcByUri.has(uri)) isrcByUri.set(uri, isrc);
+        }
+        likedIsrcByUri = isrcByUri;
+        likedIsrcs = new Set(likedIsrcByUri.values());
+    } catch (error) {
+        console.error("[Old Like Button] Failed to fetch Liked Songs", error);
+    }
+    document.dispatchEvent(likedTracksChangeEvent);
+    setTimeout(refreshLikedTracks, 30000);
+}
+
+refreshLikedTracks();
 
 (function quickLike() {
     if (
         !(
             Spicetify.React &&
             Spicetify.ReactDOM &&
-            Spicetify.SVGIcons &&
             Spicetify.showNotification &&
+            Spicetify.Platform &&
             Spicetify.Platform.PlayerAPI &&
-            Spicetify.Tippy &&
-            Spicetify.TippyProps &&
-            Spicetify.CosmosAsync &&
+            Spicetify.Platform.LibraryAPI &&
             Spicetify.Player &&
             Spicetify.Player.data
         )
@@ -99,120 +291,184 @@ initiateLikedSongs();
         return;
     }
 
-    const LikeButton = Spicetify.React.memo(function LikeButton({ uri, classList }) {
+    if (!document.getElementById("old-like-button-style")) {
+        const style = document.createElement("style");
+        style.id = "old-like-button-style";
+        style.textContent = "@keyframes oldLikeButtonTooltipIn{from{opacity:0}to{opacity:1}}";
+        document.head.appendChild(style);
+    }
 
-        const trackId = uri.replace("spotify:track:", "");
-        const [isrc, setISRC] = Spicetify.React.useState(localStorage.getItem("maskowh-oldlike-" + trackId));
-        const [isLiked, setIsLiked] = Spicetify.React.useState(likedTracksIdsISRCs.has(trackId));
-        const [hasISRCLiked, setHasISRCLiked] = Spicetify.React.useState(likedTracksISRCs.has(isrc));
-        const [isHovered, setIsHovered] = Spicetify.React.useState(false);
-        const buttonRef = Spicetify.React.useRef(null);
+    const LikeButton = Spicetify.React.memo(function LikeButton({ uri, classList, getUri }) {
 
-        Spicetify.React.useEffect(() => {
-            // Initialize tippy
-            if (buttonRef.current) {
-                const tippyInstance = Spicetify.Tippy(buttonRef.current, {
-                    ...Spicetify.TippyProps,
-                    hideOnClick: true,
-                    content: isLiked ? "Remove from Liked Songs" : hasISRCLiked ? "Add to Liked Songs (You already like another version of the exact same recording)" : "Add to Liked Songs"
-                });
-
-                return () => {
-                    tippyInstance.destroy();
-                };
-            }
-        }, [isLiked, hasISRCLiked]);
-
-        Spicetify.React.useEffect(() => {
-            async function initISRC() {
-                try {
-                    // If the ISRC is not in known ISRCs, request the track to spotify api to get the isrc and store it in local storage
-                    if (isrc == null) {
-                        console.log("Requesting the isrc for " + trackId)
-                        let track = await Spicetify.CosmosAsync.get(`https://api.spotify.com/v1/tracks/${trackId}`);
-                        setISRC(track.external_ids.isrc);
-                        localStorage.setItem("maskowh-oldlike-" + track.id, track.external_ids.isrc);
-                        setHasISRCLiked(likedTracksISRCs.has(track.external_ids.isrc));
-                    } else {
-                        setHasISRCLiked(likedTracksISRCs.has(isrc));
-                    }
-                } catch (error) {
-                    console.error('Error fetching data:', error);
+        function resolveUri() {
+            if (typeof getUri === "function") {
+                const liveUri = getUri();
+                if (liveUri) {
+                    return liveUri;
                 }
-            };
+            }
+            return uri;
+        }
 
-            initISRC();
-        }, [isLiked, hasISRCLiked]);
+        const initialUri = resolveUri();
+        const [currentUri, setCurrentUri] = Spicetify.React.useState(initialUri);
+        const [isLiked, setIsLiked] = Spicetify.React.useState(likedTrackUris.has(initialUri));
+        const [isrc, setISRC] = Spicetify.React.useState(() => readIsrcCache(initialUri));
+        const [hasISRCLiked, setHasISRCLiked] = Spicetify.React.useState(() => likedIsrcs.has(isrc));
+        const [isHovered, setIsHovered] = Spicetify.React.useState(false);
+        const [showTooltip, setShowTooltip] = Spicetify.React.useState(false);
+        const showTooltipTimeout = Spicetify.React.useRef(null);
 
-        // When the Liked Tracks list notify of a change, we set the new values
-        document.addEventListener('likedTracksChange', function (event) {
-            setIsLiked(likedTracksIdsISRCs.has(trackId));
-            setHasISRCLiked(likedTracksISRCs.has(isrc));
-        });
+        // Rows get recycled for a different track without unmounting; re-read live.
+        function syncToLiveTrack() {
+            const liveUri = resolveUri();
+            const liveIsrc = readIsrcCache(liveUri);
+            setCurrentUri(liveUri);
+            setIsLiked(likedTrackUris.has(liveUri));
+            setISRC(liveIsrc);
+            setHasISRCLiked(likedIsrcs.has(liveIsrc));
+            return { liveUri, liveIsrc };
+        }
+
+        Spicetify.React.useEffect(() => {
+            return () => clearTimeout(showTooltipTimeout.current);
+        }, []);
+
+        Spicetify.React.useEffect(() => {
+            if (isrc != null || currentUri.startsWith("spotify:local:")) return;
+            let cancelled = false;
+            resolveIsrcs([currentUri]).then(resolved => {
+                if (cancelled) return;
+                const value = resolved.get(currentUri);
+                if (value) {
+                    setISRC(value);
+                    setHasISRCLiked(likedIsrcs.has(value));
+                }
+            });
+            return () => { cancelled = true; };
+        }, [currentUri, isrc]);
+
+        Spicetify.React.useEffect(() => {
+            // syncToLiveTrack (not stale currentUri/isrc) so a row recycled to a
+            // different track self-corrects on the next liked-list change.
+            document.addEventListener('likedTracksChange', syncToLiveTrack);
+            return () => document.removeEventListener('likedTracksChange', syncToLiveTrack);
+        }, []);
+
+        const isProcessingClick = Spicetify.React.useRef(false);
 
         const handleClick = async function () {
-            Spicetify.showNotification(isLiked ? "Removed from Liked Songs" : "Added to Liked Songs");
-            if (isLiked) {
-                try {
-                    await Spicetify.CosmosAsync.del(`https://api.spotify.com/v1/me/tracks?ids=${trackId}`);
-                } catch (error) {
-                    if (error instanceof SyntaxError && error.message === 'Unexpected end of JSON input') {
-                        // Might happen since the response from this endpoint is empty, but ignore it
-                    } else {
-                        console.error(error);
-                    }
-                }
-                proxyLikedTracksIdsISRCs.delete(trackId);
-            } else {
-                try {
-                    await Spicetify.CosmosAsync.put(`https://api.spotify.com/v1/me/tracks?ids=${trackId}`);
-                } catch (error) {
-                    if (error instanceof SyntaxError && error.message === 'Unexpected end of JSON input') {
-                        // Might happen since the response from this endpoint is empty, but ignore it
-                    } else {
-                        console.error(error);
-                    }
-                }
-                if (isrc === "") {
-                    console.error("Track without isrc set. Shouldn't happen")
+            if (isProcessingClick.current) return;
+            isProcessingClick.current = true;
+
+            const { liveUri, liveIsrc: cachedIsrc } = syncToLiveTrack();
+            const liveIsLiked = likedTrackUris.has(liveUri);
+            let liveIsrc = cachedIsrc;
+
+            Spicetify.showNotification(liveIsLiked ? "Removed from Liked Songs" : "Added to Liked Songs");
+
+            try {
+                if (liveIsLiked) {
+                    await Spicetify.Platform.LibraryAPI.remove({ uris: [liveUri] });
+                    likedTrackUris.delete(liveUri);
+                    likedIsrcByUri.delete(liveUri);
+                    likedIsrcs = new Set(likedIsrcByUri.values());
+                    pendingLikeAdds.delete(liveUri);
+                    pendingLikeRemoves.add(liveUri);
                 } else {
-                    proxyLikedTracksIdsISRCs.set(trackId, isrc);
+                    if (liveIsrc == null && !liveUri.startsWith("spotify:local:")) {
+                        const resolved = await resolveIsrcs([liveUri]);
+                        liveIsrc = resolved.get(liveUri);
+                    }
+                    await Spicetify.Platform.LibraryAPI.add({ uris: [liveUri] });
+                    likedTrackUris.add(liveUri);
+                    if (liveIsrc) {
+                        likedIsrcByUri.set(liveUri, liveIsrc);
+                        likedIsrcs = new Set(likedIsrcByUri.values());
+                    }
+                    pendingLikeRemoves.delete(liveUri);
+                    pendingLikeAdds.set(liveUri, liveIsrc ?? null);
                 }
+                document.dispatchEvent(likedTracksChangeEvent);
+            } catch (error) {
+                console.error("[Old Like Button] Failed to update Liked Songs", error);
+                Spicetify.showNotification("Could not update Liked Songs, please try again", true);
+            } finally {
+                isProcessingClick.current = false;
             }
+
+            syncToLiveTrack();
         };
 
         const handleMouseOver = function () {
+            syncToLiveTrack();
             setIsHovered(true);
+            showTooltipTimeout.current = setTimeout(() => setShowTooltip(true), 200);
         }
 
         const handleMouseOut = function () {
             setIsHovered(false);
+            setShowTooltip(false);
+            clearTimeout(showTooltipTimeout.current);
         }
 
-        // Render
         return Spicetify.React.createElement(
             "button",
             {
-                ref: buttonRef,
                 className: classList,
                 "aria-checked": isLiked || hasISRCLiked,
                 onClick: handleClick,
                 onMouseOver: handleMouseOver,
                 onMouseOut: handleMouseOut,
                 style: {
+                    position: "relative",
                     marginRight: "12px",
                     opacity: (isLiked || hasISRCLiked) ? "1" : undefined
                 }
             },
+            showTooltip && Spicetify.React.createElement(
+                // Spicetify.Tippy no longer matches native styling; this copies the real one.
+                "div",
+                {
+                    role: "tooltip",
+                    style: {
+                        position: "absolute",
+                        bottom: "100%",
+                        left: "50%",
+                        transform: "translateX(-50%)",
+                        marginBottom: "8px",
+                        padding: "4px 8px",
+                        borderRadius: "4px",
+                        background: "rgb(40, 40, 40)",
+                        color: "#fff",
+                        fontSize: "14px",
+                        fontWeight: "400",
+                        whiteSpace: "nowrap",
+                        pointerEvents: "none",
+                        boxShadow: "rgba(0, 0, 0, 0.3) 0px 16px 24px 0px, rgba(0, 0, 0, 0.2) 0px 6px 8px 0px",
+                        animation: "oldLikeButtonTooltipIn 120ms ease-out",
+                        zIndex: 100
+                    }
+                },
+                isLiked ? "Remove from Liked Songs" : hasISRCLiked ? "Add to Liked Songs (you already like another version of this recording)" : "Add to Liked Songs"
+            ),
             Spicetify.React.createElement(
+                // Inline-sized instead of a hardcoded class name, which was 6px too tall.
                 "span",
-                { className: "Wrapper-sm-only Wrapper-small-only" },
+                {
+                    style: {
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        width: "16px",
+                        height: "16px"
+                    }
+                },
                 Spicetify.React.createElement("svg", {
                     role: "img",
                     height: "16",
                     width: "16",
                     viewBox: "0 0 24 24",
-                    className: (isLiked || hasISRCLiked) ? "Svg-img-icon-small-textBrightAccent" : "Svg-img-icon-small",
                     style: {
                         fill: (isLiked || hasISRCLiked) ? "var(--text-bright-accent)" : "var(--text-subdued)"
                     },
@@ -234,6 +490,7 @@ initiateLikedSongs();
 
 
     // Paybar button insertion
+    let currentPlaybarContainer = null;
     function waitForWidgetMounted() {
         nowPlayingWidget = document.querySelector(".main-nowPlayingWidget-nowPlaying");
         entryPoint = document.querySelector(".main-nowPlayingWidget-nowPlaying [data-encore-id='buttonTertiary']");
@@ -242,8 +499,15 @@ initiateLikedSongs();
             return;
         }
 
+        // The old widget (and its container) was just removed; unmount its root
+        // explicitly or its likedTracksChange listener leaks for the rest of the session.
+        if (currentPlaybarContainer) {
+            Spicetify.ReactDOM.unmountComponentAtNode(currentPlaybarContainer);
+        }
+
         const likeButtonWrapper = document.createElement("div");
         likeButtonWrapper.className = "likeControl-wrapper";
+        currentPlaybarContainer = likeButtonWrapper;
 
         renderLikeButton(likeButtonWrapper);
     }
@@ -299,60 +563,85 @@ initiateLikedSongs();
     Spicetify.Player.addEventListener("songchange", () => {
         const container = document.querySelector(".likeControl-wrapper");
         if (container) {
-            renderLikeButton(container); // Re-render on song change
+            renderLikeButton(container);
         }
     });
 
 
     // Main view button insertion
-    function findVal(object, key, max = 10) {
-        if (object[key] !== undefined || !max) {
-            return object[key];
-        }
-
-        for (const k in object) {
-            if (object[k] && typeof object[k] === "object") {
-                const value = findVal(object[k], key, --max);
-                if (value !== undefined) {
-                    return value;
-                }
+    function findUriFromFiber(domNode, maxDepth = 15) {
+        // The row's own uri is a direct prop a few fiber ancestors up, not in its children.
+        const fiberKey = Object.keys(domNode).find(key => key.startsWith("__reactFiber$"));
+        let fiber = fiberKey ? domNode[fiberKey] : null;
+        for (let i = 0; i < maxDepth && fiber; i++) {
+            const uri = fiber.memoizedProps && fiber.memoizedProps.uri;
+            if (typeof uri === "string" && /^spotify:(track|local):/.test(uri)) {
+                return uri;
             }
+            fiber = fiber.return;
         }
-
         return undefined;
+    }
+
+    function unmountWrappersWithin(node) {
+        if (!(node instanceof Element)) return;
+        const wrappers = node.matches(".likeControl-wrapper") ? [node] : [...node.querySelectorAll(".likeControl-wrapper")];
+        wrappers.forEach(wrapper => {
+            try {
+                Spicetify.ReactDOM.unmountComponentAtNode(wrapper);
+            } catch (error) {
+                console.error("[Old Like Button] Failed to unmount a row button", error);
+            }
+        });
     }
 
     const observer = new MutationObserver(mutationList => {
         mutationList.forEach(mutation => {
+            mutation.removedNodes.forEach(unmountWrappersWithin);
+
             mutation.addedNodes.forEach(node => {
-                const nodeMatch =
-                    node.attributes?.role?.value === "row"
-                        ? node.firstChild?.lastChild
-                        : node.firstChild?.attributes?.role?.value === "row"
-                            ? node.firstChild?.firstChild.lastChild
-                            : null;
+                try {
+                    const rowElement =
+                        node.attributes?.role?.value === "row"
+                            ? node
+                            : node.firstChild?.attributes?.role?.value === "row"
+                                ? node.firstChild
+                                : null;
 
-                if (nodeMatch) {
+                    const nodeMatch =
+                        node.attributes?.role?.value === "row"
+                            ? node.firstChild?.lastChild
+                            : node.firstChild?.attributes?.role?.value === "row"
+                                ? node.firstChild?.firstChild?.lastChild
+                                : null;
+
+                    if (!nodeMatch) return;
+
                     const entryPoint = nodeMatch.querySelector(":scope > button:not(:last-child):has([data-encore-id])");
+                    if (!entryPoint) return;
 
-                    if (entryPoint) {
-                        const reactPropsKey = Object.keys(node).find(key => key.startsWith("__reactProps$"));
-                        const uri = findVal(node[reactPropsKey], "uri");
+                    // Re-derived per hover/click, not captured once, to survive row recycling.
+                    const getUri = () => findUriFromFiber(rowElement);
+                    const uri = getUri();
+                    if (!uri) return;
 
-                        const likeButtonWrapper = document.createElement("div");
-                        likeButtonWrapper.className = "likeControl-wrapper";
-                        likeButtonWrapper.style.display = "contents";
-                        likeButtonWrapper.style.marginRight = 0;
+                    const likeButtonWrapper = document.createElement("div");
+                    likeButtonWrapper.className = "likeControl-wrapper";
+                    likeButtonWrapper.style.display = "contents";
+                    likeButtonWrapper.style.marginRight = 0;
 
-                        const likeButtonElement = nodeMatch.insertBefore(likeButtonWrapper, entryPoint);
-                        Spicetify.ReactDOM.render(
-                            Spicetify.React.createElement(LikeButton, {
-                                uri,
-                                classList: entryPoint.classList
-                            }),
-                            likeButtonElement
-                        );
-                    }
+                    const likeButtonElement = nodeMatch.insertBefore(likeButtonWrapper, entryPoint);
+                    Spicetify.ReactDOM.render(
+                        Spicetify.React.createElement(LikeButton, {
+                            uri,
+                            getUri,
+                            classList: entryPoint.classList
+                        }),
+                        likeButtonElement
+                    );
+                } catch (error) {
+                    // A single unexpected row shape shouldn't stop the rest of this batch.
+                    console.error("[Old Like Button] Failed to attach a row button", error);
                 }
             });
         });

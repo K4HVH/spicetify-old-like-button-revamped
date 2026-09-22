@@ -4,6 +4,11 @@
     "preview": "marketplace.png",
     "main": "oldLikeButton.js",
     "readme": "README.md",
+    "authors": [
+        { "name": "K4HVH", "url": "https://github.com/K4HVH" },
+        { "name": "Maskowh", "url": "https://github.com/Maskowh" },
+        { "name": "OhItsTom", "url": "https://github.com/ohitstom" }
+    ],
     "tags": [
         "songs",
         "utility",
