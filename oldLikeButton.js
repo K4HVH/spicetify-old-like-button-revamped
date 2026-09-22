@@ -298,7 +298,7 @@ refreshLikedTracks();
         document.head.appendChild(style);
     }
 
-    const LikeButton = Spicetify.React.memo(function LikeButton({ uri, classList, getUri }) {
+    const LikeButton = Spicetify.React.memo(function LikeButton({ uri, classList, getUri, getSelection }) {
 
         function resolveUri() {
             if (typeof getUri === "function") {
@@ -361,35 +361,49 @@ refreshLikedTracks();
             if (isProcessingClick.current) return;
             isProcessingClick.current = true;
 
-            const { liveUri, liveIsrc: cachedIsrc } = syncToLiveTrack();
+            const { liveUri } = syncToLiveTrack();
+            const selection = typeof getSelection === "function" ? getSelection() : null;
+            const selectedUris = selection ? selection.items.map(item => item.uri) : null;
+            const targetUris = selectedUris && selectedUris.includes(liveUri) ? selectedUris : [liveUri];
             const liveIsLiked = likedTrackUris.has(liveUri);
-            let liveIsrc = cachedIsrc;
 
-            Spicetify.showNotification(liveIsLiked ? "Removed from Liked Songs" : "Added to Liked Songs");
+            Spicetify.showNotification(
+                targetUris.length > 1
+                    ? (liveIsLiked ? `Removed ${targetUris.length} songs from Liked Songs` : `Added ${targetUris.length} songs to Liked Songs`)
+                    : (liveIsLiked ? "Removed from Liked Songs" : "Added to Liked Songs")
+            );
 
             try {
                 if (liveIsLiked) {
-                    await Spicetify.Platform.LibraryAPI.remove({ uris: [liveUri] });
-                    likedTrackUris.delete(liveUri);
-                    likedIsrcByUri.delete(liveUri);
+                    await Spicetify.Platform.LibraryAPI.remove({ uris: targetUris });
+                    targetUris.forEach(target => {
+                        likedTrackUris.delete(target);
+                        likedIsrcByUri.delete(target);
+                        pendingLikeAdds.delete(target);
+                        pendingLikeRemoves.add(target);
+                    });
                     likedIsrcs = new Set(likedIsrcByUri.values());
-                    pendingLikeAdds.delete(liveUri);
-                    pendingLikeRemoves.add(liveUri);
                 } else {
-                    if (liveIsrc == null && !liveUri.startsWith("spotify:local:")) {
-                        const resolved = await resolveIsrcs([liveUri]);
-                        liveIsrc = resolved.get(liveUri);
-                    }
-                    await Spicetify.Platform.LibraryAPI.add({ uris: [liveUri] });
-                    likedTrackUris.add(liveUri);
-                    if (liveIsrc) {
-                        likedIsrcByUri.set(liveUri, liveIsrc);
-                        likedIsrcs = new Set(likedIsrcByUri.values());
-                    }
-                    pendingLikeRemoves.delete(liveUri);
-                    pendingLikeAdds.set(liveUri, liveIsrc ?? null);
+                    const nonLocalTargets = targetUris.filter(target => !target.startsWith("spotify:local:"));
+                    const isrcByUri = nonLocalTargets.length ? await resolveIsrcs(nonLocalTargets) : new Map();
+                    await Spicetify.Platform.LibraryAPI.add({ uris: targetUris });
+                    targetUris.forEach(target => {
+                        likedTrackUris.add(target);
+                        const resolvedIsrc = isrcByUri.get(target);
+                        if (resolvedIsrc) likedIsrcByUri.set(target, resolvedIsrc);
+                        pendingLikeRemoves.delete(target);
+                        pendingLikeAdds.set(target, resolvedIsrc ?? null);
+                    });
+                    likedIsrcs = new Set(likedIsrcByUri.values());
                 }
                 document.dispatchEvent(likedTracksChangeEvent);
+
+                if (targetUris.length > 1 && selection) {
+                    // Spotify's own row click handling collapses the multi-selection to
+                    // just this row shortly after any click; put it back the way it was.
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    restoreSelection(selection);
+                }
             } catch (error) {
                 console.error("[Old Like Button Revamped] Failed to update Liked Songs", error);
                 Spicetify.showNotification("Could not update Liked Songs, please try again", true);
@@ -594,6 +608,50 @@ refreshLikedTracks();
         return undefined;
     }
 
+    function findSelectionApi(domNode, maxDepth = 60) {
+        // Tracklist rows sit under a context provider exposing the list's
+        // real selection state, identified by its shape (no exported symbol).
+        const fiberKey = Object.keys(domNode).find(key => key.startsWith("__reactFiber$"));
+        let fiber = fiberKey ? domNode[fiberKey] : null;
+        for (let i = 0; i < maxDepth && fiber; i++) {
+            if (fiber.tag === 10) {
+                const value = fiber.memoizedProps && fiber.memoizedProps.value;
+                if (value && typeof value.toggleSelected === "function" && typeof value.isSelected === "function" && typeof value.getSelected === "function") {
+                    return value;
+                }
+            }
+            fiber = fiber.return;
+        }
+        return null;
+    }
+
+    function getMultiSelection(rowElement) {
+        // Bulk-apply only when the clicked row is itself part of the selection,
+        // so clicking an unselected row while others are selected stays single-track.
+        if (!rowElement || rowElement.getAttribute("aria-selected") !== "true") {
+            return null;
+        }
+        const api = findSelectionApi(rowElement);
+        if (!api) return null;
+        const items = api.getSelected().filter(item => item.uri);
+        return items.length > 1 ? { api, items } : null;
+    }
+
+    function restoreSelection(selection) {
+        // toggleSelected's 3-arg form (index, rangeExtend, additive) re-adds
+        // an index the way a real ctrl-click would, instead of replacing.
+        try {
+            const current = new Set(selection.api.getSelected().map(item => item.index));
+            for (const item of selection.items) {
+                if (!current.has(item.index)) {
+                    selection.api.toggleSelected(item.index, false, true);
+                }
+            }
+        } catch (error) {
+            console.error("[Old Like Button Revamped] Failed to restore selection", error);
+        }
+    }
+
     function unmountWrappersWithin(node) {
         if (!(node instanceof Element)) return;
         const wrappers = node.matches(".likeControl-wrapper") ? [node] : [...node.querySelectorAll(".likeControl-wrapper")];
@@ -636,6 +694,7 @@ refreshLikedTracks();
 
                     // Re-derived per hover/click, not captured once, to survive row recycling.
                     const getUri = () => findUriFromFiber(rowElement);
+                    const getSelection = () => getMultiSelection(rowElement);
                     const uri = getUri();
                     if (!uri) return;
 
@@ -649,6 +708,7 @@ refreshLikedTracks();
                         Spicetify.React.createElement(LikeButton, {
                             uri,
                             getUri,
+                            getSelection,
                             classList: entryPoint.classList
                         }),
                         likeButtonElement
