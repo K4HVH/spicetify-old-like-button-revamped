@@ -561,9 +561,10 @@ refreshLikedTracks();
     }
 
     Spicetify.Player.addEventListener("songchange", () => {
-        const container = document.querySelector(".likeControl-wrapper");
-        if (container) {
-            renderLikeButton(container);
+        // Not document.querySelector(".likeControl-wrapper") - tracklist rows use
+        // that same class, so it could grab and relocate a row's button instead.
+        if (currentPlaybarContainer) {
+            renderLikeButton(currentPlaybarContainer);
         }
     });
 
