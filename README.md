@@ -1,4 +1,4 @@
-# Old Like Button Extension
+# Old Like Button Revamped
 
 ![Example](example.png)
 _Adds the old "like" button back next to the new "Add to Playlist" button on tracklist rows, including a half-heart indicator when you like a different version (remaster, live version, etc.) of the same recording._
@@ -15,7 +15,7 @@ Fork of [Maskowh/spicetify-old-like-button-extension](https://github.com/Maskowh
 
 ### Marketplace
 
-Search "Old Like Button" in the Extensions tab of Marketplace and install it. Marketplace discovers extensions automatically from public repos tagged `spicetify-extensions` on GitHub, so this fork is picked up the same way the original was.
+Search "Old Like Button Revamped" in the Extensions tab of Marketplace and install it. Marketplace discovers extensions automatically from public repos tagged `spicetify-extensions` on GitHub.
 
 ## Usage
 

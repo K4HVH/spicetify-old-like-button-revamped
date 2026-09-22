@@ -1,5 +1,5 @@
-// NAME: Old Like Button
-// AUTHOR: Maskowh, OhItsTom
+// NAME: Old Like Button Revamped
+// AUTHOR: K4HVH, Maskowh, OhItsTom
 // DESCRIPTION: Adds a button to the tracklist to add/remove a song from Liked Songs.
 // Heavily inspired of https://github.com/ohitstom/spicetify-extensions/tree/main/quickQueue, especially for rendering
 
@@ -20,7 +20,7 @@ function readIsrcCache(uri) {
     try {
         return localStorage.getItem(ISRC_STORAGE_PREFIX + uri.replace("spotify:track:", ""));
     } catch (error) {
-        console.error("[Old Like Button] localStorage read failed", error);
+        console.error("[Old Like Button Revamped] localStorage read failed", error);
         return null;
     }
 }
@@ -29,7 +29,7 @@ function writeIsrcCache(uri, isrc) {
     try {
         localStorage.setItem(ISRC_STORAGE_PREFIX + uri.replace("spotify:track:", ""), isrc);
     } catch (error) {
-        console.error("[Old Like Button] localStorage write failed", error);
+        console.error("[Old Like Button Revamped] localStorage write failed", error);
     }
 }
 
@@ -97,7 +97,7 @@ function fetchTrackMetadataBytes(uris) {
             if (settled) return;
             settled = true;
             reject(new Error("metadata service request timed out"));
-            try { cancel.cancel(); } catch (e) { console.error("[Old Like Button] cancel() after timeout failed", e); }
+            try { cancel.cancel(); } catch (e) { console.error("[Old Like Button Revamped] cancel() after timeout failed", e); }
         }, 8000);
         const cancel = service.instance.observe(
             service.descriptor.METHODS.observe.requestType.fromPartial({
@@ -107,7 +107,7 @@ function fetchTrackMetadataBytes(uris) {
                 if (response.pendingResponse || settled) return;
                 settled = true;
                 clearTimeout(timer);
-                try { cancel.cancel(); } catch (e) { console.error("[Old Like Button] cancel() after response failed", e); }
+                try { cancel.cancel(); } catch (e) { console.error("[Old Like Button Revamped] cancel() after response failed", e); }
                 // An uncaught throw here would leave this promise settled=true
                 // but never resolved/rejected, hanging every batch behind it.
                 try {
@@ -212,7 +212,7 @@ async function resolveIsrcs(uris, concurrency = 8) {
             try {
                 entries = await fetchTrackMetadataBytes(batch);
             } catch (error) {
-                console.error("[Old Like Button] Failed to fetch ISRC batch", error);
+                console.error("[Old Like Button Revamped] Failed to fetch ISRC batch", error);
                 continue;
             }
             for (const entry of entries) {
@@ -266,7 +266,7 @@ async function refreshLikedTracks() {
         likedIsrcByUri = isrcByUri;
         likedIsrcs = new Set(likedIsrcByUri.values());
     } catch (error) {
-        console.error("[Old Like Button] Failed to fetch Liked Songs", error);
+        console.error("[Old Like Button Revamped] Failed to fetch Liked Songs", error);
     }
     document.dispatchEvent(likedTracksChangeEvent);
     setTimeout(refreshLikedTracks, 30000);
@@ -391,7 +391,7 @@ refreshLikedTracks();
                 }
                 document.dispatchEvent(likedTracksChangeEvent);
             } catch (error) {
-                console.error("[Old Like Button] Failed to update Liked Songs", error);
+                console.error("[Old Like Button Revamped] Failed to update Liked Songs", error);
                 Spicetify.showNotification("Could not update Liked Songs, please try again", true);
             } finally {
                 isProcessingClick.current = false;
@@ -604,7 +604,7 @@ refreshLikedTracks();
             try {
                 Spicetify.ReactDOM.unmountComponentAtNode(wrapper);
             } catch (error) {
-                console.error("[Old Like Button] Failed to unmount a row button", error);
+                console.error("[Old Like Button Revamped] Failed to unmount a row button", error);
             }
         });
     }
@@ -655,7 +655,7 @@ refreshLikedTracks();
                     );
                 } catch (error) {
                     // A single unexpected row shape shouldn't stop the rest of this batch.
-                    console.error("[Old Like Button] Failed to attach a row button", error);
+                    console.error("[Old Like Button Revamped] Failed to attach a row button", error);
                 }
             });
         });

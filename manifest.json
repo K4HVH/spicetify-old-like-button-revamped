@@ -1,5 +1,5 @@
 {
-    "name": "Old Like Button",
+    "name": "Old Like Button Revamped",
     "description": "Adds a button to the tracklist to add/remove a song from the Liked Songs.",
     "preview": "marketplace.png",
     "main": "oldLikeButton.js",
