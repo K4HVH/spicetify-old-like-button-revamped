@@ -499,17 +499,23 @@ refreshLikedTracks();
             return;
         }
 
-        // The old widget (and its container) was just removed; unmount its root
-        // explicitly or its likedTracksChange listener leaks for the rest of the session.
-        if (currentPlaybarContainer) {
-            Spicetify.ReactDOM.unmountComponentAtNode(currentPlaybarContainer);
-        }
-
         const likeButtonWrapper = document.createElement("div");
         likeButtonWrapper.className = "likeControl-wrapper";
-        currentPlaybarContainer = likeButtonWrapper;
+        const inserted = renderLikeButton(likeButtonWrapper);
+        if (!inserted) {
+            // entryPoint can go stale mid-transition (e.g. a song skip re-rendering
+            // the widget); retry instead of leaving no button at all.
+            setTimeout(waitForWidgetMounted, 300);
+            return;
+        }
 
-        renderLikeButton(likeButtonWrapper);
+        // Only unmount the previous root now that its replacement is confirmed
+        // inserted, so a failed retry above never leaves the button just gone.
+        if (currentPlaybarContainer) {
+            Spicetify.ReactDOM.unmountComponentAtNode(currentPlaybarContainer);
+            currentPlaybarContainer.remove();
+        }
+        currentPlaybarContainer = likeButtonWrapper;
     }
 
     (function attachObserver() {
@@ -536,6 +542,9 @@ refreshLikedTracks();
     function renderLikeButton(container) {
         const uri = Spicetify.Player.data?.item?.uri || "";
         const entryPoint = document.querySelector(".main-nowPlayingWidget-nowPlaying [data-encore-id='buttonTertiary']");
+        if (!entryPoint) {
+            return false;
+        }
 
         try {
             // Standard case
@@ -546,7 +555,7 @@ refreshLikedTracks();
                 entryPoint.parentNode.parentNode.parentNode.insertBefore(container, entryPoint.nextSibling);
             } catch (altError) {
                 console.error("Failed to insert like button", error, altError);
-                return;
+                return false;
             }
         }
         Spicetify.ReactDOM.render(
@@ -558,6 +567,7 @@ refreshLikedTracks();
             container
         );
         container.firstChild.style.marginRight = "0px";
+        return true;
     }
 
     Spicetify.Player.addEventListener("songchange", () => {
@@ -588,6 +598,9 @@ refreshLikedTracks();
         if (!(node instanceof Element)) return;
         const wrappers = node.matches(".likeControl-wrapper") ? [node] : [...node.querySelectorAll(".likeControl-wrapper")];
         wrappers.forEach(wrapper => {
+            // waitForWidgetMounted owns this one; unmounting it here raced its
+            // own re-render on every song change and wiped the button out.
+            if (wrapper === currentPlaybarContainer) return;
             try {
                 Spicetify.ReactDOM.unmountComponentAtNode(wrapper);
             } catch (error) {
