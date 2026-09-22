@@ -25,6 +25,8 @@ Search "Old Like Button Revamped" in the Extensions tab of Marketplace and insta
 
 Hover a tracklist row to see the button; click to add or remove from Liked Songs.
 
+Multi-select rows (shift-click or ctrl-click) and click any selected row's button to add or remove all of them at once.
+
 ## Credits
 
 Original extension by [Maskowh](https://github.com/Maskowh), with the rendering approach based on [ohitstom](https://github.com/ohitstom)'s [Quick Queue extension](https://github.com/ohitstom/spicetify-extensions/blob/main/quickQueue/README.md).
