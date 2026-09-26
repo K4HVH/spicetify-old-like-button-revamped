@@ -633,19 +633,45 @@ refreshLikedTracks();
         }
         const api = findSelectionApi(rowElement);
         if (!api) return null;
-        const items = api.getSelected().filter(item => item.uri);
-        return items.length > 1 ? { api, items } : null;
+        // Entries keep the uri they were recorded with and outlive their row, so
+        // isSelected drops ones whose row the list has since dropped or moved.
+        const items = api.getSelected().filter(item => item.uri && api.isSelected(item.index));
+        if (items.length < 2) return null;
+
+        // A surviving entry can still describe a track the row no longer shows, so
+        // only act when the selection matches every row on screen.
+        const uris = new Set(items.map(item => item.uri));
+        const container = rowElement.closest(".main-trackList-trackList");
+        const rendered = container ? [...container.querySelectorAll('[role="row"][aria-selected]')] : [];
+        const matchesView = rendered.every(row => {
+            const uri = findUriFromFiber(row);
+            return uri == null || (row.getAttribute("aria-selected") === "true") === uris.has(uri);
+        });
+        return matchesView ? { api, items } : null;
     }
 
     function restoreSelection(selection) {
         // toggleSelected's 3-arg form (index, rangeExtend, additive) re-adds
         // an index the way a real ctrl-click would, instead of replacing.
         try {
-            const current = new Set(selection.api.getSelected().map(item => item.index));
-            for (const item of selection.items) {
-                if (!current.has(item.index)) {
+            const wantedUriByIndex = new Map(selection.items.map(item => [item.index, item.uri]));
+            for (const item of selection.api.getSelected()) {
+                if (!wantedUriByIndex.has(item.index)) {
                     selection.api.toggleSelected(item.index, false, true);
                 }
+            }
+            for (const index of wantedUriByIndex.keys()) {
+                if (!selection.api.isSelected(index)) {
+                    selection.api.toggleSelected(index, false, true);
+                }
+            }
+            // Indices are list positions, so a list that shrank under us (unliking
+            // on Liked Songs drops rows) leaves them pointing at other tracks.
+            const restored = selection.api.getSelected();
+            const intact = restored.length === wantedUriByIndex.size
+                && restored.every(item => wantedUriByIndex.get(item.index) === item.uri);
+            if (!intact) {
+                selection.api.clearSelected();
             }
         } catch (error) {
             console.error("[Old Like Button Revamped] Failed to restore selection", error);
