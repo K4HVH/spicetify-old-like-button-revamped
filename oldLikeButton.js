@@ -505,9 +505,16 @@ refreshLikedTracks();
 
     // Paybar button insertion
     let currentPlaybarContainer = null;
+    function findPlaybarEntryPoint() {
+        // Scoped to the action wrapper and to a real button: the widget also has a
+        // "Switch to video" div carrying buttonTertiary that sorts earlier.
+        return document.querySelector(".main-nowPlayingWidget-actionButtonWrapper button[data-encore-id='buttonTertiary']")
+            || document.querySelector(".main-nowPlayingWidget-nowPlaying button[data-encore-id='buttonTertiary']");
+    }
+
     function waitForWidgetMounted() {
         nowPlayingWidget = document.querySelector(".main-nowPlayingWidget-nowPlaying");
-        entryPoint = document.querySelector(".main-nowPlayingWidget-nowPlaying [data-encore-id='buttonTertiary']");
+        entryPoint = findPlaybarEntryPoint();
         if (!(nowPlayingWidget && entryPoint)) {
             setTimeout(waitForWidgetMounted, 300);
             return;
@@ -555,22 +562,18 @@ refreshLikedTracks();
 
     function renderLikeButton(container) {
         const uri = Spicetify.Player.data?.item?.uri || "";
-        const entryPoint = document.querySelector(".main-nowPlayingWidget-nowPlaying [data-encore-id='buttonTertiary']");
+        const entryPoint = findPlaybarEntryPoint();
         if (!entryPoint) {
             return false;
         }
 
         try {
-            // Standard case
-            entryPoint.parentNode.parentNode.insertBefore(container, entryPoint.nextSibling);
+            // nextSibling is a child of parentNode by definition, so this cannot
+            // throw the way walking up to a grandparent did.
+            entryPoint.parentNode.insertBefore(container, entryPoint.nextSibling);
         } catch (error) {
-            try {
-                // Smart shuffle case
-                entryPoint.parentNode.parentNode.parentNode.insertBefore(container, entryPoint.nextSibling);
-            } catch (altError) {
-                console.error("Failed to insert like button", error, altError);
-                return false;
-            }
+            console.error("[Old Like Button Revamped] Failed to insert the playbar button", error);
+            return false;
         }
         Spicetify.ReactDOM.render(
             Spicetify.React.createElement(LikeButton, {
